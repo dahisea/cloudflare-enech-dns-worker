@@ -46,7 +46,11 @@ const UPSTREAM_DNS_SERVERS = [
 
 // ── 域名规则 ──────────────────────────────────────────────────────
 const DOMAIN_RULES = [
-  { domain: 'dash.cloudflare.com', forceCloudflare: true },
+  { domain: 'twimg.com', forceCloudflare: true },
+  { domain: 'twitter.com', forceCloudflare: true },
+  { domain: 'api.x.com', forceCloudflare: true },
+  { domain: 'grok.x.com', forceCloudflare: true },
+  { domain: 'x.com', forceCloudflare: true },
 ];
 
 const CF_DOMAIN_LIST = ['workers.dev', 'pages.dev', 'cloudflarestatus.com'];
