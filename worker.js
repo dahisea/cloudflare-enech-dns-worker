@@ -48,6 +48,7 @@ const UPSTREAM_DNS_SERVERS = [
 const DOMAIN_RULES = [
   { domain: 'twimg.com', forceCloudflare: true },
   { domain: 'twitter.com', forceCloudflare: true },
+  { domain: 'upload.x.com', forceCloudflare: true },
   { domain: 'api.x.com', forceCloudflare: true },
   { domain: 'grok.x.com', forceCloudflare: true },
   { domain: 'x.com', forceCloudflare: true },
