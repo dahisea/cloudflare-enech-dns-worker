@@ -38,7 +38,11 @@ const UPSTREAM_DNS_SERVERS = [
 ];
 
 const DOMAIN_RULES = [
-  { domain: 'dash.cloudflare.com', forceCloudflare: true },
+  { domain: 'twimg.com', forceCloudflare: true },
+  { domain: 'twitter.com', forceCloudflare: true },
+  { domain: 'api.x.com', forceCloudflare: true },
+  { domain: 'grok.x.com', forceCloudflare: true },
+  { domain: 'x.com', forceCloudflare: true },
 ];
 
 const CF_DOMAIN_LIST = ['workers.dev', 'pages.dev', 'cloudflarestatus.com'];
@@ -60,7 +64,7 @@ const TTL_BYTES = [
   (OPTIMIZED_TTL >> 8)  & 0xFF,
    OPTIMIZED_TTL        & 0xFF,
 ];
-const ALPN_H3 = encodeAlpn(['h3']);
+const ALPN_H3 = encodeAlpn(['h3,h2']);
 
 // ══════════════════════════════════════════════════════════════════
 // Debug
