@@ -1,56 +1,49 @@
-// Cloudflare Worker — DoH Proxy (Max Performance)
+// Cloudflare Snippet — DoH Proxy (Snippets Compatible)
+// 与 Worker 版的差异：
+//   1. 禁用 Cache API（Snippets 不支持 caches.default）
+//   2. 移除所有 env 参数（Snippets 无 Bindings）
+//   3. handleRequest 改为串行，避免并发 subrequest 超限
+//   4. SOA 查询改为单服务器（1.1.1.1）
+//   5. 上游 DNS 只保留 1 个
 
 // ╔══════════════════════════════════════════════════════════════╗
 // ║                        Config                               ║
-// ║              所有开关集中在这里，按需修改                        ║
 // ╚══════════════════════════════════════════════════════════════╝
 
 const ALLOWED_PATH  = '/linuxdo/dns-query';
-const OPTIMIZED_TTL = 3600;
+const OPTIMIZED_TTL = 1;
 
-// ── 调试日志 ─────────────────────────────────────────────────────
 const DEBUG = false;
 
-// ── ECH 配置 ──────────────────────────────────────────────────────
-// 'local'   — 始终用内置硬编码值，零网络请求（推荐）
-// 'fetch'   — 动态拉取，失败自动回退硬编码值
 const ECH_MODE = 'local';
 
-// ── 缓存开关 ──────────────────────────────────────────────────────
 const CACHE = {
-  // CF 检测结果 — 内存缓存（isolate 级别，0 延迟）
   MEM_CF:        true,
   MEM_CF_TTL:    1_800_000,   // ms，30 分钟
-  MEM_CF_MAX:    500,         // 超出时触发清理
+  MEM_CF_MAX:    500,
 
-  // ECH 配置 — 内存缓存（isolate 级别）
-  // ECH_MODE='local' 时此项无意义（硬编码值本就常驻）
   MEM_ECH:       true,
 
-  // CF 检测结果 — 持久化缓存（CF Cache API，跨 isolate，免费开箱即用）
-  PERSIST_CF:       true,
-  PERSIST_CF_TTL:   3600,     // 秒，1 小时
+  // Snippets 不支持 Cache API，强制关闭
+  PERSIST_CF:    false,
+  PERSIST_CF_TTL:   3600,
 
-  // ECH 配置 — 持久化缓存（CF Cache API）
-  // 仅在 ECH_MODE='fetch' 时有意义
-  PERSIST_ECH:      true,
-  PERSIST_ECH_TTL:  86400,    // 秒，24 小时
+  PERSIST_ECH:   false,
+  PERSIST_ECH_TTL:  86400,
 };
 
-// ── 上游 DNS ──────────────────────────────────────────────────────
+// Snippets 每请求只允许有限 subrequest，只保留 1 个上游
 const UPSTREAM_DNS_SERVERS = [
   'https://chrome.cloudflare-dns.com/dns-query',
-  'https://dns.google/dns-query',
-  'https://dns.quad9.net/dns-query',
 ];
 
-// ── 域名规则 ──────────────────────────────────────────────────────
 const DOMAIN_RULES = [
   { domain: 'twimg.com', forceCloudflare: true },
   { domain: 'twitter.com', forceCloudflare: true },
   { domain: 'upload.x.com', forceCloudflare: true },
   { domain: 'api.x.com', forceCloudflare: true },
   { domain: 'grok.x.com', forceCloudflare: true },
+  { domain: 'chat.x.com', forceCloudflare: true },
   { domain: 'x.com', forceCloudflare: true },
 ];
 
@@ -63,8 +56,8 @@ const ECH_DOMAIN   = 'cloudflare-ech.com';
 const ECH_FALLBACK = 'AEX+DQBBFAAgACApLi37Py03Z3TinersGhjjAEUIL3f9fMaU+5eDjSoHAAAEAAEAAQASY2xvdWRmbGFyZS1lY2guY29tAAA=';
 
 // ── 内存缓存实例 ───────────────────────────────────────────────────
-const memCfCache  = new Map();   // domain → { isCf, ts }
-let   memEchCache = null;        // Uint8Array | null
+const memCfCache  = new Map();
+let   memEchCache = null;
 
 // ── 启动时预计算 ───────────────────────────────────────────────────
 const TTL_BYTES = [
@@ -73,7 +66,7 @@ const TTL_BYTES = [
   (OPTIMIZED_TTL >> 8)  & 0xFF,
    OPTIMIZED_TTL        & 0xFF,
 ];
-const ALPN_H3 = encodeAlpn(['h3']);
+const ALPN_H3 = encodeAlpn(['h3,h2']);
 
 // ══════════════════════════════════════════════════════════════════
 // Debug
@@ -84,16 +77,19 @@ function log(...args) {
 }
 
 // ══════════════════════════════════════════════════════════════════
-// Entry
+// Entry — 串行执行，严格控制 subrequest 数量
+// 缓存命中：0 subrequest（SOA）+ 1（上游）= 1
+// SOA 查询：1 subrequest（SOA）+ 1（上游）= 2
+// 命中 CF  ：1 subrequest（SOA）+ 0       = 1
 // ══════════════════════════════════════════════════════════════════
 
 export default {
-  fetch(request, env) {
-    return handleRequest(request, env);
+  fetch(request) {
+    return handleRequest(request);
   }
 };
 
-async function handleRequest(request, env) {
+async function handleRequest(request) {
   const url = new URL(request.url);
   if (url.pathname !== ALLOWED_PATH)
     return new Response('Not Found', { status: 404 });
@@ -117,24 +113,20 @@ async function handleRequest(request, env) {
     const rule = matchDomainRule(queryName);
     if (rule?.forceCloudflare) {
       log(`domain rule forceCloudflare matched: ${queryName}`);
-      return handleCfQuery(queryType, dnsQuery, rule.a ?? null, env);
+      return handleCfQuery(queryType, dnsQuery, rule.a ?? null);
     }
 
-    // 并行：上游转发 + CF 检测同时启动
-    // 有缓存时 CF 检测 0ms 完成，abort 上游节省带宽
-    const abort           = new AbortController();
-    const upstreamPromise = forwardToUpstream(dnsQuery, abort.signal);
-    const isCf            = await checkIfCloudflare(queryName, env);
+    // 先做 CF 检测，再决定是否转发上游，避免并发超限
+    const isCf = await checkIfCloudflare(queryName);
     log(`CF detection for ${queryName}: isCf=${isCf}`);
 
     if (isCf) {
-      abort.abort();
       log(`serving CF response for ${queryName} type=${queryType}`);
-      return handleCfQuery(queryType, dnsQuery, null, env);
+      return handleCfQuery(queryType, dnsQuery, null);
     }
 
     log(`forwarding to upstream for ${queryName} type=${queryType}`);
-    return filterDnssecFromResponse(await upstreamPromise);
+    return filterDnssecFromResponse(await forwardToUpstream(dnsQuery));
 
   } catch (err) {
     log(`handleRequest error: ${err?.message}`);
@@ -146,13 +138,13 @@ async function handleRequest(request, env) {
 // CF Query Handler
 // ══════════════════════════════════════════════════════════════════
 
-async function handleCfQuery(queryType, originalQuery, customIPs, env) {
+async function handleCfQuery(queryType, originalQuery, customIPs) {
   const ips = customIPs ?? CF_FIXED_IPS;
   if (queryType === 28) return createEmptyDnsResponse(originalQuery);
   if (queryType === 1)  return createARecordResponse(originalQuery, ips);
   if (queryType === 5)  return createEmptyDnsResponse(originalQuery);
   if (queryType === 65) {
-    const ech = await getEchConfig(env);
+    const ech = await getEchConfig();
     return createCfHttpsResponse(originalQuery, ips, ech);
   }
   return filterDnssecFromResponse(await forwardToUpstream(originalQuery));
@@ -176,11 +168,10 @@ function matchDomainRule(queryName) {
 }
 
 // ══════════════════════════════════════════════════════════════════
-// CF Detection
-// 查找顺序：内存缓存 → 静态白名单 → 持久化缓存 → SOA 查询
+// CF Detection（内存缓存 + 静态白名单 + SOA 查询）
 // ══════════════════════════════════════════════════════════════════
 
-async function checkIfCloudflare(domain, env) {
+async function checkIfCloudflare(domain) {
   const key = domain.toLowerCase();
   const now = Date.now();
 
@@ -193,158 +184,93 @@ async function checkIfCloudflare(domain, env) {
     }
   }
 
-  // 2. 静态白名单（命中后写入所有已启用缓存）
+  // 2. 静态白名单
   if (CF_DOMAIN_LIST.some(d => domain === d || domain.endsWith('.' + d))) {
     log(`CF domain list hit: ${domain}`);
-    writeCfCache(key, true, now, env);
+    writeCfCache(key, true, now);
     return true;
   }
 
-  // 3. 持久化缓存
-  if (CACHE.PERSIST_CF) {
-    const cached = await persistGet('cf:' + key);
-    if (cached !== null) {
-      const isCf = cached === '1';
-      log(`CF persist-cache hit: ${domain} isCf=${isCf}`);
-      if (CACHE.MEM_CF) memCfCache.set(key, { isCf, ts: now });
-      return isCf;
-    }
-  }
-
-  // 4. SOA 查询（两服务器并行竞速）
+  // 3. SOA 查询（单服务器，节省 subrequest 配额）
   let isCf = false;
   try { isCf = await querySoaIsCloudflare(domain); } catch {}
   log(`SOA result for ${domain}: isCf=${isCf}`);
 
-  writeCfCache(key, isCf, now, env);
+  writeCfCache(key, isCf, now);
   return isCf;
 }
 
-function writeCfCache(key, isCf, now, env) {
-  if (CACHE.MEM_CF) {
-    memCfCache.set(key, { isCf, ts: now });
-    // 概率清理过期项
-    if (memCfCache.size > CACHE.MEM_CF_MAX && Math.random() < 0.05) {
-      const cutoff = now - CACHE.MEM_CF_TTL;
-      for (const [k, v] of memCfCache) if (v.ts < cutoff) memCfCache.delete(k);
-    }
-  }
-  if (CACHE.PERSIST_CF)
-    persistSet('cf:' + key, isCf ? '1' : '0', CACHE.PERSIST_CF_TTL).catch(() => {});
-}
-
-// ══════════════════════════════════════════════════════════════════
-// Persistent Cache — CF Cache API（跨 isolate，免费，开箱即用）
-// key 格式：'cf:domain' | 'ech:domain'
-// ══════════════════════════════════════════════════════════════════
-
-const PERSIST_NS = 'https://doh-internal.cache/';
-
-async function persistGet(key) {
-  try {
-    const res = await caches.default.match(new Request(PERSIST_NS + key));
-    if (!res) return null;
-    return await res.text();
-  } catch {
-    return null;
+function writeCfCache(key, isCf, now) {
+  if (!CACHE.MEM_CF) return;
+  memCfCache.set(key, { isCf, ts: now });
+  if (memCfCache.size > CACHE.MEM_CF_MAX && Math.random() < 0.05) {
+    const cutoff = now - CACHE.MEM_CF_TTL;
+    for (const [k, v] of memCfCache) if (v.ts < cutoff) memCfCache.delete(k);
   }
 }
 
-async function persistSet(key, value, ttlSec) {
-  try {
-    await caches.default.put(
-      new Request(PERSIST_NS + key),
-      new Response(value, {
-        headers: {
-          'Cache-Control': `public, max-age=${ttlSec}`,
-          'Content-Type':  'text/plain',
-        },
-      })
-    );
-  } catch {}
-}
+// ══════════════════════════════════════════════════════════════════
+// 持久化缓存 — Snippets 不支持，降级为空操作
+// ══════════════════════════════════════════════════════════════════
+
+async function persistGet(_key)             { return null; }
+async function persistSet(_key, _val, _ttl) { }
 
 // ══════════════════════════════════════════════════════════════════
-// SOA via DoH JSON API — 两服务器并行竞速
+// SOA via DoH JSON API — 单服务器，节省 subrequest 配额
+// 选 1.1.1.1：CF 自有节点，延迟最低且最可靠
 // ══════════════════════════════════════════════════════════════════
 
 async function querySoaIsCloudflare(domain) {
-  const servers = [
-    `https://1.1.1.1/dns-query?name=${encodeURIComponent(domain)}&type=SOA`,
-    `https://dns.google/resolve?name=${encodeURIComponent(domain)}&type=SOA`,
-  ];
-
-  const results = await Promise.allSettled(
-    servers.map(url =>
-      fetch(url, { headers: { accept: 'application/dns-json' } }).then(async r => {
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
-        const data = await r.json();
-        log(`SOA raw [${domain}] from ${url}: ${JSON.stringify(data).slice(0, 400)}`);
-        for (const section of [data.Answer, data.Authority]) {
-          if (!Array.isArray(section)) continue;
-          for (const rr of section) {
-            if (rr.type === 6) {
-              const matched = rr.data.toLowerCase().includes('cloudflare.com');
-              log(`SOA RR data="${rr.data}" → cloudflare=${matched}`);
-              return matched;
-            }
-          }
+  const url = `https://1.1.1.1/dns-query?name=${encodeURIComponent(domain)}&type=SOA`;
+  try {
+    const r = await fetch(url, { headers: { accept: 'application/dns-json' } });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    const data = await r.json();
+    log(`SOA raw [${domain}]: ${JSON.stringify(data).slice(0, 400)}`);
+    for (const section of [data.Answer, data.Authority]) {
+      if (!Array.isArray(section)) continue;
+      for (const rr of section) {
+        if (rr.type === 6) {
+          const matched = rr.data.toLowerCase().includes('cloudflare.com');
+          log(`SOA RR data="${rr.data}" → cloudflare=${matched}`);
+          return matched;
         }
-        log(`SOA no type-6 record found for ${domain}`);
-        return false;
-      })
-    )
-  );
-
-  for (const r of results) if (r.status === 'fulfilled') return r.value;
-  log(`SOA all servers failed for ${domain}`);
+      }
+    }
+  } catch (e) {
+    log(`SOA fetch failed: ${e?.message}`);
+  }
+  log(`SOA no type-6 record found for ${domain}`);
   return false;
 }
 
 // ══════════════════════════════════════════════════════════════════
 // ECH Config
-// 缓存查找顺序：内存 → 持久化 → 动态拉取 → 硬编码兜底
 // ══════════════════════════════════════════════════════════════════
 
-async function getEchConfig(env) {
-  // local 模式：硬编码值解码一次后常驻内存，零网络请求
+async function getEchConfig() {
   if (ECH_MODE === 'local') {
     if (!memEchCache) memEchCache = base64UrlDecode(ECH_FALLBACK);
     return memEchCache;
   }
 
-  // fetch 模式：内存缓存
   if (CACHE.MEM_ECH && memEchCache) {
     log('ECH mem-cache hit');
     return memEchCache;
   }
 
-  // fetch 模式：持久化缓存
-  if (CACHE.PERSIST_ECH) {
-    const cached = await persistGet('ech:' + ECH_DOMAIN);
-    if (cached) {
-      log('ECH persist-cache hit');
-      const ech = base64UrlDecode(cached);
-      if (CACHE.MEM_ECH) memEchCache = ech;
-      return ech;
-    }
-  }
-
-  // fetch 模式：动态拉取
   try {
     const q    = stripDnssecFromQuery(buildDnsQuery(ECH_DOMAIN, 65));
     const resp = await forwardToUpstream(q);
     const ech  = extractEchFromHttpsResponse(new Uint8Array(await resp.arrayBuffer()));
     if (ech?.length) {
       log('ECH fetched from upstream');
-      if (CACHE.MEM_ECH)    memEchCache = ech;
-      if (CACHE.PERSIST_ECH)
-        persistSet('ech:' + ECH_DOMAIN, base64UrlEncode(ech), CACHE.PERSIST_ECH_TTL).catch(() => {});
+      if (CACHE.MEM_ECH) memEchCache = ech;
       return ech;
     }
   } catch {}
 
-  // 兜底
   log('ECH using fallback');
   const fallback = base64UrlDecode(ECH_FALLBACK);
   if (CACHE.MEM_ECH) memEchCache = fallback;
@@ -377,22 +303,18 @@ function extractEchFromHttpsResponse(data) {
 }
 
 // ══════════════════════════════════════════════════════════════════
-// Upstream Forwarding — 全并行竞速，流式透传
+// Upstream Forwarding — 单服务器
 // ══════════════════════════════════════════════════════════════════
 
 async function forwardToUpstream(dnsQuery, signal) {
-  const b64        = base64UrlEncode(dnsQuery);
-  const fetch_opts = { headers: { accept: 'application/dns-message' }, signal };
-  log(`forwardToUpstream racing ${UPSTREAM_DNS_SERVERS.length} servers`);
-
-  const races = UPSTREAM_DNS_SERVERS.map(s =>
-    fetch(`${s}?dns=${b64}`, fetch_opts).then(r =>
-      r.ok ? r : Promise.reject(new Error(String(r.status)))
-    )
-  );
-
+  const b64 = base64UrlEncode(dnsQuery);
+  log(`forwardToUpstream → ${UPSTREAM_DNS_SERVERS[0]}`);
   try {
-    const r = await Promise.any(races);
+    const r = await fetch(
+      `${UPSTREAM_DNS_SERVERS[0]}?dns=${b64}`,
+      { headers: { accept: 'application/dns-message' }, signal }
+    );
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
     log('upstream responded ok');
     return new Response(r.body, { headers: { 'content-type': 'application/dns-message' } });
   } catch (e) {
@@ -407,15 +329,11 @@ async function forwardToUpstream(dnsQuery, signal) {
 
 function createCfHttpsResponse(originalQuery, ips, ech) {
   const data = [0x00, 0x01, 0x00];
-
   data.push(0x00, 0x01, (ALPN_H3.length >> 8) & 0xFF, ALPN_H3.length & 0xFF, ...ALPN_H3);
-
   const ipBytes = ips.flatMap(ip => ip.split('.').map(Number));
   data.push(0x00, 0x04, (ipBytes.length >> 8) & 0xFF, ipBytes.length & 0xFF, ...ipBytes);
-
   if (ech?.length)
     data.push(0x00, 0x05, (ech.length >> 8) & 0xFF, ech.length & 0xFF, ...ech);
-
   return buildRRResponse(originalQuery, 65, new Uint8Array(data));
 }
 
@@ -556,7 +474,6 @@ function filterDnssecRecords(resp) {
   const nsCount = (resp[8] << 8) | resp[9];
   const arCount = (resp[10] << 8) | resp[11];
 
-  // 快速扫描：无 DNSSEC 记录则零拷贝直接返回原始 buffer
   let needsFilter = false;
   let scan = sectStart;
   for (let i = 0; i < anCount + nsCount + arCount && scan < resp.length; i++) {
