@@ -1,5 +1,5 @@
 # 给 CloudFlare (以及其它) CDN 网站强制开启 ECH 的 DNS
-
+[文档](../doc/zh.md)
 # cloudflare-enech-dns-worker
 A dns server that enable ech for all cf hosted domains.
 
